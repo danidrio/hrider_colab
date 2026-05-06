@@ -1,3 +1,5 @@
 from .anonymizer import Anonymizer
+from .excel_anonymizer import ExcelAnonymizer
+from .excel_anonymization_report import ExcelAnonymizationReport
 from .pdf_anonymizer import PDFAnonymizer
 from .pdf_anonymization_report import PDFAnonymizationReport
