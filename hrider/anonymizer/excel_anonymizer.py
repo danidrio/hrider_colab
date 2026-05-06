@@ -1,5 +1,3 @@
-from copy import deepcopy
-
 import pandas as pd
 
 from hrider.anonymizer.anonymizer import Anonymizer
@@ -119,7 +117,6 @@ class ExcelAnonymizer:
         for column_name in dataframe.columns:
             config = sheet_config.get(column_name, {})
             
-
             anonymize_column = bool(config.get("anonymize", True))
 
             if not anonymize_column:
@@ -204,7 +201,7 @@ class ExcelAnonymizer:
         }
 
     def _build_column_anonymizer(self, llm_detection, thresholds):
-        column_anonymizer = deepcopy(self.anonymizer)
+        column_anonymizer = self.anonymizer
         column_anonymizer.enable_llm_step(llm_detection)
 
         for key, value in thresholds.items():
