@@ -10,8 +10,26 @@ class ExcelAnonymizer:
     Permite activar/desactivar LLM por columna.
     """
 
+    DEFAULT_LLM_BATCH_SIZE = 10
+
     def __init__(self, anonymizer=None):
         self.anonymizer = anonymizer or Anonymizer()
+        self._llm_batch_size = self.DEFAULT_LLM_BATCH_SIZE
+
+    def get_llm_batch_size(self):
+        """Devuelve el número de textos que se envían por lote al Anonymizer."""
+        return self._llm_batch_size
+
+    def set_llm_batch_size(self, llm_batch_size):
+        """
+        Define el número de textos que se envían por lote al Anonymizer.
+
+        Debe ser un entero mayor que cero.
+        """
+        if not isinstance(llm_batch_size, int) or llm_batch_size <= 0:
+            raise ValueError("llm_batch_size must be an integer greater than 0")
+
+        self._llm_batch_size = llm_batch_size
 
     def anonymize_excel(
         self,
@@ -145,28 +163,62 @@ class ExcelAnonymizer:
             matches = []
             rows_with_matches_count = 0
 
-            for row_index, value in dataframe[column_name].items():
-                if not isinstance(value, str) or not value.strip:
-                    continue
+            values_to_process = [
+                (row_index, value)
+                for row_index, value in dataframe[column_name].items()
+                if isinstance(value, str) and value.strip()
+            ]
 
-                processed += 1
-                result = column_anonymizer.anonymize(value, people=people)
-                dataframe.at[row_index, column_name] = result["anonymized_text"]
+            for batch in self._iter_batches(values_to_process, self._llm_batch_size):
+                batch_items = [
+                    {
+                        "id": str(row_index),
+                        "text": value,
+                    }
+                    for row_index, value in batch
+                ]
+                original_values_by_id = {
+                    str(row_index): value
+                    for row_index, value in batch
+                }
+                row_indexes_by_id = {
+                    str(row_index): row_index
+                    for row_index, _ in batch
+                }
 
-                if result["anonymized_text"] != value:
-                    changed += 1
+                batch_results = self._anonymize_batch(
+                    column_anonymizer=column_anonymizer,
+                    items=batch_items,
+                    people=people,
+                )
 
-                if result.get("manual_review_required", False):
-                    manual_review_required = True
+                for result in batch_results:
+                    result_id = str(result.get("id"))
 
-                if result.get("matches"):
-                    rows_with_matches_count += 1
+                    if result_id not in row_indexes_by_id:
+                        continue
 
-                    if store_matches:
-                        matches.append({
-                            "row_index": int(row_index),
-                            "matches": result["matches"],
-                        })
+                    row_index = row_indexes_by_id[result_id]
+                    value = original_values_by_id[result_id]
+                    anonymized_text = result["anonymized_text"]
+
+                    processed += 1
+                    dataframe.at[row_index, column_name] = anonymized_text
+
+                    if anonymized_text != value:
+                        changed += 1
+
+                    if result.get("manual_review_required", False):
+                        manual_review_required = True
+
+                    if result.get("matches"):
+                        rows_with_matches_count += 1
+
+                        if store_matches:
+                            matches.append({
+                                "row_index": int(row_index),
+                                "matches": result["matches"],
+                            })
 
             column_result = {
                 "column_name": str(column_name),
@@ -210,3 +262,34 @@ class ExcelAnonymizer:
             setattr(column_anonymizer, key, value)
 
         return column_anonymizer
+
+    def _iter_batches(self, values, batch_size):
+        for start_index in range(0, len(values), batch_size):
+            yield values[start_index:start_index + batch_size]
+
+    def _anonymize_batch(self, column_anonymizer, items, people):
+        """
+        Anonimiza una lista de items usando la API batch canonica de Anonymizer.
+
+        Cada item debe tener esta forma:
+            {"id": "row_index", "text": "texto"}
+
+        El id permite reconciliar correctamente cada resultado con su fila de Excel,
+        incluso si el backend LLM o el Anonymizer devuelven resultados en otro orden.
+        """
+        if not items:
+            return []
+
+        batch_method = getattr(column_anonymizer, "anonymize_batch", None)
+
+        if not callable(batch_method):
+            raise AttributeError(
+                "El Anonymizer configurado debe exponer anonymize_batch(items, people=None)"
+            )
+
+        results = batch_method(items, people=people)
+
+        if not isinstance(results, list):
+            raise ValueError("anonymize_batch debe devolver una lista de resultados")
+
+        return results

@@ -149,6 +149,8 @@ class Anonymizer:
         "OTRO"
     }
 
+    DEFAULT_LLM_BATCH_SIZE = 10
+
     DEFAULT_LLM_DETECTION_PROMPT = """
 Eres un detector de datos sensibles en texto en español.
 
@@ -165,9 +167,12 @@ Instrucciones:
 - No resumas.
 - No expliques tus decisiones.
 - Devuelve únicamente JSON válido.
-- Detecta solo fragmentos que aparezcan literalmente en el texto.
-- Cada hallazgo debe corresponder a un substring exacto del texto recibido en este prompt,
-  que ya puede contener marcadores de anonimización de fases anteriores.
+- Vas a recibir una lista JSON de elementos con esta forma:
+  [{"id":"...", "text":"..."}, ...]
+- Detecta solo fragmentos que aparezcan literalmente en el campo text de cada
+  elemento.
+- Cada hallazgo debe corresponder a un substring exacto del text recibido para
+  ese id, que ya puede contener marcadores de anonimización de fases anteriores.
 - Conserva exactamente espacios, signos de puntuación y saltos de línea del
   fragmento detectado.
 - No normalices, traduzcas, corrijas ni completes fragmentos.
@@ -180,7 +185,7 @@ Instrucciones:
   [TELEFONO], [DIRECCION], [ROL], [OTRO] o [REVISAR_LLM].
 - Tu tarea es detectar únicamente datos sensibles residuales que todavía
   aparezcan en claro después de esa primera anonimización.
-- Si no encuentras nada, devuelve {"matches": []}.
+- Si no encuentras nada en un elemento, devuelve "matches": [] para ese id.
 - Cuando haya varios datos sensibles dentro de una misma frase, devuelve cada dato 
   como un match separado. No devuelvas la frase completa si contiene varias entidades.    
 
@@ -243,12 +248,17 @@ Ejemplos de direcciones completas:
     
 Formato de salida:
 {{
-  "matches": [
+  "results": [
     {{
-      "matched_fragment": "texto exacto encontrado",
-      "entity_type": "PERSONA",
-      "risk_level": "high",
-      "manual_review_required": false
+      "id": "id_original",
+      "matches": [
+        {{
+          "matched_fragment": "texto exacto encontrado",
+          "entity_type": "PERSONA",
+          "risk_level": "high",
+          "manual_review_required": false
+        }}
+      ]
     }}
   ]
 }}
@@ -258,9 +268,9 @@ Valores permitidos:
 - risk_level: low, medium o high.
 - manual_review_required: true o false. Debe ser booleano JSON, no texto.
 
-Texto:
+Items JSON:
 <<<
-{text}
+{items_json}
 >>>
 """.strip()
 
@@ -331,7 +341,8 @@ Texto:
         fuzzy_review_threshold=95,
         enable_llm_detection=False,
         llm_client=None,
-        llm_detection_prompt=None
+        llm_detection_prompt=None,
+        llm_batch_size=DEFAULT_LLM_BATCH_SIZE
     ):
         self.regex_patterns = deepcopy(
             regex_patterns
@@ -351,6 +362,7 @@ Texto:
             if llm_detection_prompt
             else self.DEFAULT_LLM_DETECTION_PROMPT
         )
+        self.set_llm_batch_size(llm_batch_size)
 
     def add_regex_pattern(self, entity_type, regex_pattern, replacement, risk_level="high"):
         pattern_config = {
@@ -391,6 +403,14 @@ Texto:
     def enable_llm_step(self, enabled=True):
         self.enable_llm_detection = bool(enabled)
 
+    def get_llm_batch_size(self):
+        return self._llm_batch_size
+
+    def set_llm_batch_size(self, llm_batch_size):
+        if not isinstance(llm_batch_size, int) or llm_batch_size <= 0:
+            raise ValueError("llm_batch_size must be an integer greater than 0")
+        self._llm_batch_size = llm_batch_size
+
 
     def anonymize(self, text, people=None):
         """
@@ -410,43 +430,104 @@ Texto:
             }
         ]
         """
+        batch_results = self.anonymize_batch(
+            [{"id": "0", "text": str(text)}],
+            people=people
+        )
+        if not batch_results:
+            return {
+                "original_text": str(text),
+                "text_after_regex": str(text),
+                "text_after_people": str(text),
+                "anonymized_text": str(text),
+                "regex_matches": [],
+                "people_matches": [],
+                "llm_matches": [],
+                "llm_detection_skipped": True,
+                "llm_error": None,
+                "matches": [],
+                "pdf_matches": [],
+                "manual_review_required": False
+            }
+        return batch_results[0]
+
+    def anonymize_batch(self, items, people=None):
         if people is None:
             people = []
+        if items is None:
+            items = []
+        if not isinstance(items, list):
+            raise ValueError("items debe ser una lista")
 
-        text = str(text)
+        prepared = []
+        llm_input_items = []
 
-        regex_result = self.anonymize_regex_entities(text)
-        text_after_regex = regex_result["anonymized_text"]
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
 
-        people_result = self.anonymize_people(text_after_regex, people)
-        text_after_people = people_result["anonymized_text"]
+            item_id = str(item.get("id", index))
+            text = str(item.get("text", ""))
 
-        llm_result = self.anonymize_llm_entities(text_after_people)
+            regex_result = self.anonymize_regex_entities(text)
+            text_after_regex = regex_result["anonymized_text"]
 
-        all_matches = (
-            regex_result["matches"]
-            + people_result["matches"]
-            + llm_result["matches"]
-        )
+            people_result = self.anonymize_people(text_after_regex, people)
+            text_after_people = people_result["anonymized_text"]
 
-        return {
-            "original_text": text,
-            "text_after_regex": text_after_regex,
-            "text_after_people": text_after_people,
-            "anonymized_text": llm_result["anonymized_text"],
-            "regex_matches": regex_result["matches"],
-            "people_matches": people_result["matches"],
-            "llm_matches": llm_result["matches"],
-            "llm_detection_skipped": llm_result.get("llm_detection_skipped", False),
-            "llm_error": llm_result.get("llm_error"),
-            "matches": all_matches,
-            "pdf_matches": self._build_pdf_matches(all_matches),
-            "manual_review_required": (
-                regex_result["manual_review_required"]
-                or people_result["manual_review_required"]
-                or llm_result["manual_review_required"]
+            prepared_item = {
+                "id": item_id,
+                "original_text": text,
+                "text_after_regex": text_after_regex,
+                "text_after_people": text_after_people,
+                "regex_matches": regex_result["matches"],
+                "people_matches": people_result["matches"],
+                "_base_manual_review_required": (
+                    regex_result["manual_review_required"]
+                    or people_result["manual_review_required"]
+                ),
+            }
+            prepared.append(prepared_item)
+            llm_input_items.append({"id": item_id, "text": text_after_people})
+
+        llm_results_by_id = self.anonymize_llm_entities_batch(llm_input_items)
+
+        results = []
+        for prepared_item in prepared:
+            llm_result = llm_results_by_id.get(prepared_item["id"], {
+                "anonymized_text": prepared_item["text_after_people"],
+                "matches": [],
+                "manual_review_required": False,
+                "llm_detection_skipped": True,
+                "llm_error": None
+            })
+
+            all_matches = (
+                prepared_item["regex_matches"]
+                + prepared_item["people_matches"]
+                + llm_result["matches"]
             )
-        }
+
+            results.append({
+                "id": prepared_item["id"],
+                "original_text": prepared_item["original_text"],
+                "text_after_regex": prepared_item["text_after_regex"],
+                "text_after_people": prepared_item["text_after_people"],
+                "anonymized_text": llm_result["anonymized_text"],
+                "regex_matches": prepared_item["regex_matches"],
+                "people_matches": prepared_item["people_matches"],
+                "llm_matches": llm_result["matches"],
+                "llm_detection_skipped": llm_result.get("llm_detection_skipped", False),
+                "llm_error": llm_result.get("llm_error"),
+                "matches": all_matches,
+                "pdf_matches": self._build_pdf_matches(all_matches),
+                "manual_review_required": (
+                    prepared_item["_base_manual_review_required"]
+                    or llm_result["manual_review_required"]
+                )
+            })
+
+        return results
 
 
     def _build_pdf_matches(self, matches):
@@ -460,7 +541,6 @@ Texto:
 
         for match in matches:
             fragment = str(match.get("matched_fragment", "")).strip()
-
             if not fragment:
                 continue
 
@@ -654,58 +734,88 @@ Texto:
         y no se sustituyen.        
         """
         text = str(text)
+        batch_result = self.anonymize_llm_entities_batch([{"id": "0", "text": text}])
+        return batch_result.get("0", {
+            "original_text": text,
+            "anonymized_text": text,
+            "matches": [],
+            "manual_review_required": False,
+            "llm_detection_skipped": True,
+            "llm_error": None
+        })
+
+    def anonymize_llm_entities_batch(self, items):
+        if items is None:
+            items = []
+
+        prepared = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", index))
+            text = str(item.get("text", ""))
+            prepared.append({"id": item_id, "text": text})
+
+        if not prepared:
+            return {}
 
         if not self.enable_llm_detection:
             return {
-                "original_text": text,
-                "anonymized_text": text,
-                "matches": [],
-                "manual_review_required": False,
-                "llm_detection_skipped": True,
-                "llm_error": None                
+                item["id"]: {
+                    "original_text": item["text"],
+                    "anonymized_text": item["text"],
+                    "matches": [],
+                    "manual_review_required": False,
+                    "llm_detection_skipped": True,
+                    "llm_error": None
+                }
+                for item in prepared
             }
 
         if self.llm_client is None:
             raise ValueError("llm_client no configurado")
 
         try:
-            llm_matches = self.detect_llm_entities(text)
+            detected_by_id = self.detect_llm_entities_batch(prepared)
+            llm_error = None
+            llm_detection_skipped = False
         except Exception as exc:
-            #print(exc)
-            return {
-                "original_text": text,
-                "anonymized_text": text,
-                "matches": [],
-                "manual_review_required": False,
-                "llm_detection_skipped": True,
-                "llm_error": str(exc)
-            }
+            detected_by_id = {}
+            llm_error = str(exc)
+            llm_detection_skipped = True
 
-        llm_matches = self._deduplicate_overlapping_matches(llm_matches)
-
-        spans_to_redact = [
-            {
-                "start": match["start"],
-                "end": match["end"],
-                "replacement": match["replacement"]
-            }
-            for match in llm_matches
-            if match.get("auto_redact", True)
-        ]
-
-        anonymized_text = self._replace_spans(text, spans_to_redact)
-
-        return {
-            "original_text": text,
-            "anonymized_text": anonymized_text,
-            "matches": llm_matches,
-            "llm_detection_skipped": False,
-            "llm_error": None,
-            "manual_review_required": any(
-                match.get("manual_review_required", False)
-                for match in llm_matches
+        results = {}
+        for item in prepared:
+            item_id = item["id"]
+            text = item["text"]
+            llm_matches = self._deduplicate_overlapping_matches(
+                detected_by_id.get(item_id, [])
             )
-        }
+
+            spans_to_redact = [
+                {
+                    "start": match["start"],
+                    "end": match["end"],
+                    "replacement": match["replacement"]
+                }
+                for match in llm_matches
+                if match.get("auto_redact", True)
+            ]
+            anonymized_text = self._replace_spans(text, spans_to_redact)
+
+            results[item_id] = {
+                "original_text": text,
+                "anonymized_text": anonymized_text,
+                "matches": llm_matches,
+                "llm_detection_skipped": llm_detection_skipped,
+                "llm_error": llm_error,
+                "manual_review_required": any(
+                    match.get("manual_review_required", False)
+                    for match in llm_matches
+                )
+            }
+
+        return results
 
     def detect_regex_entities(self, text):
         """
@@ -763,7 +873,6 @@ Texto:
 
                 for match in variant_matches:
                     is_fuzzy = match["score"] < 100
-
                     matches.append({
                         "entity_type": "PERSONA",
                         "employee_id": person.get("employee_id"),
@@ -785,7 +894,7 @@ Texto:
                         "end": match["end"],
                         "source": "people_fuzzy" if is_fuzzy else "people_exact"
                     })
-
+                    
         return self._deduplicate_overlapping_matches(matches)
 
     def detect_llm_entities(self, text):
@@ -793,68 +902,103 @@ Texto:
         Pide a un LLM entidades sensibles adicionales sobre el texto recibido.
         """
         text = str(text)
-        prompt = self._render_llm_detection_prompt(text)
-        print(".", end="", flush=True)
-        response = self.llm_client.generate(prompt)
-        payload = self._parse_llm_json_response(response)
-        matches = []
+        results = self.detect_llm_entities_batch([{"id": "0", "text": text}])
+        return self._deduplicate_overlapping_matches(results.get("0", []))
 
-        for candidate in payload.get("matches", []):
-            matched_fragment = str(candidate.get("matched_fragment", ""))
-
-            if not matched_fragment.strip():
+    def detect_llm_entities_batch(self, items):
+        prepared = []
+        for index, item in enumerate(items or []):
+            if not isinstance(item, dict):
                 continue
-            
-            manual_review_required = candidate.get("manual_review_required", True)
-            if not isinstance(manual_review_required, bool):
-                manual_review_required = True
+            prepared.append({
+                "id": str(item.get("id", index)),
+                "text": str(item.get("text", ""))
+            })
 
-            entity_type = str(
-                candidate.get("entity_type", "OTRO")
-            ).strip().upper() or "OTRO"
+        if not prepared:
+            return {}
 
-            if entity_type not in self.LLM_ALLOWED_ENTITY_TYPES:
-                entity_type = "OTRO"
+        matches_by_id = {item["id"]: [] for item in prepared}
+        text_by_id = {item["id"]: item["text"] for item in prepared}
 
-            replacement = (
-                "[REVISAR_LLM]"
-                if entity_type == "OTRO"
-                else f"[{entity_type}]"
-            )
+        for batch in self._iter_batches(prepared, self._llm_batch_size):
+            prompt = self._render_llm_detection_prompt_batch(batch)
+            print(".", end="")
+            response = self.llm_client.generate(prompt)
+            payload = self._parse_llm_batch_json_response(response)
 
-            risk_level = str(
-                candidate.get("risk_level", "medium")
-            ).strip().lower() or "medium"
+            for result_item in payload.get("results", []):
+                item_id = str(result_item.get("id", ""))
 
-            if risk_level not in {"low", "medium", "high"}:
-                risk_level = "medium"
+                if item_id not in text_by_id:
+                    continue
 
-            positions = self._find_literal_occurrences(text, matched_fragment)
+                text = text_by_id[item_id]
+                for candidate in result_item.get("matches", []):
+                    if not isinstance(candidate, dict):
+                        continue
 
-            for start, end in positions:
-                matches.append({
-                    "entity_type": entity_type,
-                    "matched_fragment": matched_fragment,
-                    "matched_fragment_normalized": self._normalize_text(
-                        matched_fragment
-                    ),
-                    "score": 100,
-                    "auto_redact": not manual_review_required,
-                    "manual_review_required": manual_review_required,
-                    "replacement": replacement,
-                    "risk_level": risk_level,
-                    "start": start,
-                    "end": end,
-                    "source": "llm"
-                })
+                    matched_fragment = str(candidate.get("matched_fragment", ""))
+                    if not matched_fragment.strip():
+                        continue
 
-        return self._deduplicate_overlapping_matches(matches)
+                    manual_review_required = candidate.get("manual_review_required", True)
+                    if not isinstance(manual_review_required, bool):
+                        manual_review_required = True
 
-    def _render_llm_detection_prompt(self, text):
+                    entity_type = str(
+                        candidate.get("entity_type", "OTRO")
+                    ).strip().upper() or "OTRO"
+                    if entity_type not in self.LLM_ALLOWED_ENTITY_TYPES:
+                        entity_type = "OTRO"
+
+                    replacement = (
+                        "[REVISAR_LLM]"
+                        if entity_type == "OTRO"
+                        else f"[{entity_type}]"
+                    )
+
+                    risk_level = str(
+                        candidate.get("risk_level", "medium")
+                    ).strip().lower() or "medium"
+                    if risk_level not in {"low", "medium", "high"}:
+                        risk_level = "medium"
+
+                    positions = self._find_literal_occurrences(text, matched_fragment)
+                    for start, end in positions:
+                        matches_by_id[item_id].append({
+                            "entity_type": entity_type,
+                            "matched_fragment": matched_fragment,
+                            "matched_fragment_normalized": self._normalize_text(
+                                matched_fragment
+                            ),
+                            "score": 100,
+                            "auto_redact": not manual_review_required,
+                            "manual_review_required": manual_review_required,
+                            "replacement": replacement,
+                            "risk_level": risk_level,
+                            "start": start,
+                            "end": end,
+                            "source": "llm"
+                        })
+
+        return {
+            item_id: self._deduplicate_overlapping_matches(item_matches)
+            for item_id, item_matches in matches_by_id.items()
+        }
+
+    def _render_llm_detection_prompt_batch(self, items):
         prompt = str(self.llm_detection_prompt)
+        items_json = json.dumps(items, ensure_ascii=False)
 
+        if "{items_json}" in prompt:
+            return prompt.replace("{items_json}", items_json)
         if "{text}" in prompt:
-            return prompt.replace("{text}", text)
+            # Compatibilidad con prompts antiguos.
+            fallback_text = "\n\n".join(
+                f"[id={item['id']}]\n{item['text']}" for item in items
+            )
+            return prompt.replace("{text}", fallback_text)
 
         return prompt
 
@@ -881,6 +1025,10 @@ Texto:
                 })
 
         return matches
+
+    def _iter_batches(self, values, batch_size):
+        for start_index in range(0, len(values), batch_size):
+            yield values[start_index:start_index + batch_size]
 
     def _find_literal_occurrences(self, text, fragment):
         """
@@ -1154,3 +1302,41 @@ Texto:
             raise ValueError("respuesta LLM invalida: matches debe ser lista")
 
         return payload
+
+    def _parse_llm_batch_json_response(self, response):
+        payload = self._parse_llm_json_response(response)
+
+        if "results" not in payload:
+            # Compatibilidad defensiva con payload legacy de un único texto.
+            if "matches" in payload:
+                return {
+                    "results": [
+                        {
+                            "id": "0",
+                            "matches": payload.get("matches", [])
+                        }
+                    ]
+                }
+            raise ValueError("respuesta LLM invalida: falta results")
+
+        results = payload.get("results", [])
+        if not isinstance(results, list):
+            raise ValueError("respuesta LLM invalida: results debe ser lista")
+
+        normalized_results = []
+        for result_item in results:
+            if not isinstance(result_item, dict):
+                continue
+            result_id = str(result_item.get("id", "")).strip()
+            result_matches = result_item.get("matches", [])
+            if not isinstance(result_matches, list):
+                continue
+            if not result_id:
+                continue
+            normalized_results.append({
+                "id": result_id,
+                "matches": result_matches
+            })
+
+        return {"results": normalized_results}
+    
