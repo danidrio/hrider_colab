@@ -37,12 +37,6 @@ class ExcelAnonymizer:
         output_path,
         people=None,
         column_config=None,
-        full_name_threshold=None,
-        email_user_threshold=None,
-        initial_lastname_threshold=None,
-        first_name_threshold=None,
-        last_name_threshold=None,
-        fuzzy_review_threshold=None,
         store_matches=True,
     ):
         """
@@ -50,26 +44,27 @@ class ExcelAnonymizer:
 
         Parámetros:
         - column_config:
-          Array de configuraciones por hoja en orden ordinal.
+          Array de configuraciones por hoja en orden ordinal para seleccionar
+          qué columnas anonimizar.
           La posición 0 aplica a la primera hoja, la 1 a la segunda, etc.
           Ejemplo:
           [
             {
-              "comments": {"anonymize": True, "llm_detection": True},
-              "name": {"anonymize": False}
+              "comments": {"llm_detection": True},
+              "details": {}
             },
             {
               "notes": {"llm_detection": True}
             }
           ]
-          - anonymize:
-            Si es False, la columna se omite.
-            Si no se especifica, se anonimiza por defecto.
+          Si se informa column_config, solo se procesan las columnas incluidas
+          en cada hoja configurada.
+          Si column_config es None, se procesan todas las columnas.
           - llm_detection:
             Si no se especifica, False por defecto.
-        - Los thresholds son globales para todas las columnas procesadas.
         """
         people = people or []
+        restrict_to_configured_columns = column_config is not None
         column_config = list(column_config or [])
 
         excel_file = pd.ExcelFile(str(input_path))
@@ -90,15 +85,8 @@ class ExcelAnonymizer:
                 sheet_index=sheet_index,
                 sheet_name=sheet_name,
                 sheet_config=sheet_config,
+                restrict_to_configured_columns=restrict_to_configured_columns,
                 people=people,
-                thresholds={
-                    "full_name_threshold": full_name_threshold,
-                    "email_user_threshold": email_user_threshold,
-                    "initial_lastname_threshold": initial_lastname_threshold,
-                    "first_name_threshold": first_name_threshold,
-                    "last_name_threshold": last_name_threshold,
-                    "fuzzy_review_threshold": fuzzy_review_threshold,
-                },
                 store_matches=store_matches,
             )
 
@@ -125,8 +113,8 @@ class ExcelAnonymizer:
         sheet_index,
         sheet_name,
         sheet_config,
+        restrict_to_configured_columns,
         people,
-        thresholds,
         store_matches,
     ):
         dataframe = dataframe.copy()
@@ -134,19 +122,16 @@ class ExcelAnonymizer:
 
         for column_name in dataframe.columns:
             config = sheet_config.get(column_name, {})
-            
-            anonymize_column = bool(config.get("anonymize", True))
 
-            if not anonymize_column:
+            if restrict_to_configured_columns and column_name not in sheet_config:
                 column_results.append({
                     "column_name": str(column_name),
                     "configured": column_name in sheet_config,
                     "processed": False,
-                    "reason": "anonymization_disabled",
+                    "reason": "not_in_column_config",
                     "cells_processed": 0,
                     "cells_changed": 0,
                     "manual_review_required": False,
-                    "anonymize": False,
                     "llm_detection": bool(config.get("llm_detection", False)),
                 })
                 continue
@@ -154,7 +139,6 @@ class ExcelAnonymizer:
             llm_detection = bool(config.get("llm_detection", False))
             column_anonymizer = self._build_column_anonymizer(
                 llm_detection=llm_detection,
-                thresholds=thresholds,
             )
 
             processed = 0
@@ -227,7 +211,6 @@ class ExcelAnonymizer:
                 "cells_processed": processed,
                 "cells_changed": changed,
                 "manual_review_required": manual_review_required,
-                "anonymize": True,
                 "llm_detection": llm_detection,
             }
 
@@ -252,14 +235,9 @@ class ExcelAnonymizer:
             },
         }
 
-    def _build_column_anonymizer(self, llm_detection, thresholds):
+    def _build_column_anonymizer(self, llm_detection):
         column_anonymizer = self.anonymizer
         column_anonymizer.enable_llm_step(llm_detection)
-
-        for key, value in thresholds.items():
-            if value is None:
-                continue
-            setattr(column_anonymizer, key, value)
 
         return column_anonymizer
 

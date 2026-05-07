@@ -446,7 +446,6 @@ Items JSON:
                 "llm_detection_skipped": True,
                 "llm_error": None,
                 "matches": [],
-                "pdf_matches": [],
                 "manual_review_required": False
             }
         return batch_results[0]
@@ -520,7 +519,6 @@ Items JSON:
                 "llm_detection_skipped": llm_result.get("llm_detection_skipped", False),
                 "llm_error": llm_result.get("llm_error"),
                 "matches": all_matches,
-                "pdf_matches": self._build_pdf_matches(all_matches),
                 "manual_review_required": (
                     prepared_item["_base_manual_review_required"]
                     or llm_result["manual_review_required"]
@@ -528,135 +526,6 @@ Items JSON:
             })
 
         return results
-
-
-    def _build_pdf_matches(self, matches):
-        """
-        Construye la lista de matches que se intentarán aplicar sobre el PDF.
-
-        - Aquí solo se filtran matches automáticos y se deduplican por fragmento,
-          replacement, tipo y fuente.
-        """
-        pdf_matches = []
-
-        for match in matches:
-            fragment = str(match.get("matched_fragment", "")).strip()
-            if not fragment:
-                continue
-
-            if not match.get("auto_redact", True):
-                continue
-
-            pdf_matches.append(match)
-
-        return self._deduplicate_pdf_matches(pdf_matches)
-
-
-    def _deduplicate_pdf_matches(self, matches):
-        """
-        Reglas:
-        - No usa posiciones porque los matches vienen de fases distintas.
-        - Elimina duplicados equivalentes aunque vengan de fuentes distintas.
-        - Prioriza reemplazos específicos de persona, como [PERSONA:EMP001],
-        frente a reemplazos genéricos como [PERSONA].
-        - Prioriza detecciones de people sobre LLM cuando representan personas.
-        """
-        if not matches:
-            return []
-
-        def replacement_priority(match):
-            replacement = str(match.get("replacement", ""))
-            source = str(match.get("source", ""))
-            entity_type = str(match.get("entity_type", "")).upper()
-
-            if entity_type == "PERSONA" and replacement.startswith("[PERSONA:"):
-                return 100
-
-            if entity_type == "PERSONA" and source.startswith("people"):
-                return 90
-
-            if entity_type == "PERSONA" and replacement == "[PERSONA]":
-                return 50
-
-            if source == "regex":
-                return 80
-
-            if source == "llm":
-                return 40
-
-            return 10
-
-        sorted_matches = sorted(
-            matches,
-            key=lambda match: (
-                -replacement_priority(match),
-                -len(str(match.get("matched_fragment", ""))),
-                str(match.get("entity_type", "")),
-                str(match.get("replacement", "")),
-            )
-        )
-
-        unique = []
-
-        for match in sorted_matches:
-            fragment = str(match.get("matched_fragment", "")).strip()
-            replacement = str(match.get("replacement", ""))
-            entity_type = str(match.get("entity_type", "")).upper()
-            normalized = str(
-                match.get("matched_fragment_normalized")
-                or self._normalize_text(fragment)
-            )
-
-            if not fragment:
-                continue
-
-            discard = False
-
-            for chosen in unique:
-                chosen_fragment = str(chosen.get("matched_fragment", "")).strip()
-                chosen_replacement = str(chosen.get("replacement", ""))
-                chosen_entity_type = str(chosen.get("entity_type", "")).upper()
-                chosen_normalized = str(
-                    chosen.get("matched_fragment_normalized")
-                    or self._normalize_text(chosen_fragment)
-                )
-
-                same_entity = entity_type == chosen_entity_type
-                same_fragment = fragment == chosen_fragment
-                same_normalized = normalized and normalized == chosen_normalized
-
-                # Duplicado real aunque venga de otra fuente.
-                if same_entity and (same_fragment or same_normalized):
-                    discard = True
-                    break
-
-                # Caso específico:
-                # si ya tenemos [PERSONA:EMP001], no conservar un [PERSONA]
-                # genérico para el mismo texto normalizado o incluido.
-                if entity_type == "PERSONA" and chosen_entity_type == "PERSONA":
-                    current_is_generic = replacement == "[PERSONA]"
-                    chosen_is_specific = chosen_replacement.startswith("[PERSONA:")
-
-                    if current_is_generic and chosen_is_specific:
-                        if (
-                            same_normalized
-                            or normalized in chosen_normalized
-                            or chosen_normalized in normalized
-                        ):
-                            discard = True
-                            break
-
-            if not discard:
-                unique.append(match)
-
-        return sorted(
-            unique,
-            key=lambda match: (
-                -len(str(match.get("matched_fragment", ""))),
-                str(match.get("entity_type", "")),
-                str(match.get("replacement", ""))
-            )
-        )
 
     def anonymize_regex_entities(self, text):
         """
@@ -922,7 +791,8 @@ Items JSON:
         text_by_id = {item["id"]: item["text"] for item in prepared}
 
         for batch in self._iter_batches(prepared, self._llm_batch_size):
-            prompt = self._render_llm_detection_prompt_batch(batch)
+            items_json = json.dumps(batch, ensure_ascii=False)
+            prompt = str(self.llm_detection_prompt).replace("{items_json}", items_json)
             print(".", end="")
             response = self.llm_client.generate(prompt)
             payload = self._parse_llm_batch_json_response(response)
@@ -987,21 +857,6 @@ Items JSON:
             for item_id, item_matches in matches_by_id.items()
         }
 
-    def _render_llm_detection_prompt_batch(self, items):
-        prompt = str(self.llm_detection_prompt)
-        items_json = json.dumps(items, ensure_ascii=False)
-
-        if "{items_json}" in prompt:
-            return prompt.replace("{items_json}", items_json)
-        if "{text}" in prompt:
-            # Compatibilidad con prompts antiguos.
-            fallback_text = "\n\n".join(
-                f"[id={item['id']}]\n{item['text']}" for item in items
-            )
-            return prompt.replace("{text}", fallback_text)
-
-        return prompt
-
     def _find_all_matches(self, person_name, ngrams, threshold=90):
         """
         Devuelve todas las coincidencias cuyo score supera el umbral.
@@ -1037,14 +892,13 @@ Items JSON:
         positions = []
         start = 0
 
-        while True:
-            index = text.find(fragment, start)
-
-            if index == -1:
-                return positions
-
+        index = text.find(fragment, start)
+        while (index != -1):
             positions.append((index, index + len(fragment)))
             start = index + len(fragment)
+            index = text.find(fragment, start)
+
+        return positions
 
     def _fuzzy_score(self, a, b):
         return max(

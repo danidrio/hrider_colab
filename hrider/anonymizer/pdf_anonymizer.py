@@ -57,7 +57,7 @@ class PDFAnonymizer:
                 # de matches. Las posiciones start/end de regex, people y LLM
                 # pueden pertenecer a textos intermedios distintos, por lo que
                 # PDFAnonymizer localiza visualmente por matched_fragment.
-                page_matches = result.get("pdf_matches", result["matches"])
+                page_matches = self._build_pdf_matches(result.get("matches", []))
                 self._apply_matches_to_page(page, page_matches)
                 page_result = {
                     "page_number": page_index,
@@ -113,6 +113,140 @@ class PDFAnonymizer:
                 for page_result in page_results
             )
         }
+
+    def _build_pdf_matches(self, matches):
+        """
+        Construye la lista de matches que se intentarán aplicar sobre el PDF.
+
+        - Aquí solo se filtran matches automáticos y se deduplican por fragmento,
+          replacement, tipo y fuente.
+        """
+        pdf_matches = []
+
+        for match in matches:
+            fragment = str(match.get("matched_fragment", "")).strip()
+            if not fragment:
+                continue
+
+            if not match.get("auto_redact", True):
+                continue
+
+            pdf_matches.append(match)
+
+        return self._deduplicate_pdf_matches(pdf_matches)
+
+
+    def _deduplicate_pdf_matches(self, matches):
+        """
+        Reglas:
+        - No usa posiciones porque los matches vienen de fases distintas.
+        - Elimina duplicados equivalentes aunque vengan de fuentes distintas.
+        - Prioriza reemplazos específicos de persona, como [PERSONA:EMP001],
+        frente a reemplazos genéricos como [PERSONA].
+        - Prioriza detecciones de people sobre LLM cuando representan personas.
+        """
+        if not matches:
+            return []
+
+        def replacement_priority(match):
+            replacement = str(match.get("replacement", ""))
+            source = str(match.get("source", ""))
+            entity_type = str(match.get("entity_type", "")).upper()
+
+            if entity_type == "PERSONA" and replacement.startswith("[PERSONA:"):
+                return 100
+
+            if entity_type == "PERSONA" and source.startswith("people"):
+                return 90
+
+            if entity_type == "PERSONA" and replacement == "[PERSONA]":
+                return 50
+
+            if source == "regex":
+                return 80
+
+            if source == "llm":
+                return 40
+
+            return 10
+
+        sorted_matches = sorted(
+            matches,
+            key=lambda match: (
+                -replacement_priority(match),
+                -len(str(match.get("matched_fragment", ""))),
+                str(match.get("entity_type", "")),
+                str(match.get("replacement", "")),
+            )
+        )
+
+        unique = []
+
+        for match in sorted_matches:
+            fragment = str(match.get("matched_fragment", "")).strip()
+            replacement = str(match.get("replacement", ""))
+            entity_type = str(match.get("entity_type", "")).upper()
+            normalized = str(
+                match.get("matched_fragment_normalized")
+                or self._normalize_text(fragment)
+            )
+
+            if not fragment:
+                continue
+
+            discard = False
+
+            for chosen in unique:
+                chosen_fragment = str(chosen.get("matched_fragment", "")).strip()
+                chosen_replacement = str(chosen.get("replacement", ""))
+                chosen_entity_type = str(chosen.get("entity_type", "")).upper()
+                chosen_normalized = str(
+                    chosen.get("matched_fragment_normalized")
+                    or self._normalize_text(chosen_fragment)
+                )
+
+                same_entity = entity_type == chosen_entity_type
+                same_fragment = fragment == chosen_fragment
+                same_normalized = normalized and normalized == chosen_normalized
+
+                # Duplicado real aunque venga de otra fuente.
+                if same_entity and (same_fragment or same_normalized):
+                    discard = True
+                    break
+
+                # Caso específico:
+                # si ya tenemos [PERSONA:EMP001], no conservar un [PERSONA]
+                # genérico para el mismo texto normalizado o incluido.
+                if entity_type == "PERSONA" and chosen_entity_type == "PERSONA":
+                    current_is_generic = replacement == "[PERSONA]"
+                    chosen_is_specific = chosen_replacement.startswith("[PERSONA:")
+
+                    if current_is_generic and chosen_is_specific:
+                        if (
+                            same_normalized
+                            or normalized in chosen_normalized
+                            or chosen_normalized in normalized
+                        ):
+                            discard = True
+                            break
+
+            if not discard:
+                unique.append(match)
+
+        return sorted(
+            unique,
+            key=lambda match: (
+                -len(str(match.get("matched_fragment", ""))),
+                str(match.get("entity_type", "")),
+                str(match.get("replacement", ""))
+            )
+        )
+
+    def _normalize_text(self, text):
+        normalize_method = getattr(self.anonymizer, "_normalize_text", None)
+        if callable(normalize_method):
+            return str(normalize_method(text))
+        return str(text).strip().lower()
 
 
     def _count_matches_by_entity_type(self, matches):
@@ -422,6 +556,7 @@ class PDFAnonymizer:
         file_results = []
 
         for input_path in pdf_paths:
+            print(input_path)
             relative_path = input_path.relative_to(input_dir)
             output_parent = output_dir / relative_path.parent
             output_parent.mkdir(parents=True, exist_ok=True)
